@@ -1,9 +1,20 @@
-use libc::{c_int, sockaddr, socklen_t};
+pub mod connection;
+pub mod connection_listener;
+pub mod proxychains;
+
+use connection::Connection;
+use connection_listener::ConnectionListener;
+use futures::{task::Waker, StreamExt};
+use libc::{c_int, c_void, size_t, sockaddr, socklen_t, ssize_t};
+use proxychains::{ProxyChains, ProxyChainsConf, ProxyChainsMode};
 use std::ffi::CString;
 use std::{
+    collections::HashMap,
     mem::transmute,
     net::{Ipv4Addr, SocketAddr},
+    sync::mpsc::{channel, Sender},
 };
+use tokio::{io::copy, runtime::Runtime};
 
 // Get function pointer
 pub unsafe fn fn_ptr(name: &str) -> *mut core::ffi::c_void {
@@ -37,6 +48,93 @@ pub fn i8_to_u8(n: i8) -> u8 {
     }
 }
 
+// Holds a Connection instance identified by its file descriptor
+static mut CONNECTIONS: *mut HashMap<u32, Connection> = 0 as *mut _;
+
+// Waker of ConnectionListener
+// Note: Since ConnectionListener is a STREAM of Connections,
+// there should be a way to inform it about a new Connection.
+// Therefore, in case of new Connection, CONNECTION_LISTENER_WAKER.wake()
+// is called.
+static mut CONNECTION_LISTENER_WAKER: *mut Waker = 0 as *mut _;
+
+// Sender half of a channel which is responsible to give new Connection(s) to
+// ConnectionListener
+static mut CONNECTION_SENDER: *mut Sender<(u32, SocketAddr)> = 0 as *mut _;
+
+// Check if Connection to target address exists
+unsafe fn exists(sockaddr: SocketAddr) -> bool {
+    for (_fd, connection) in (*CONNECTIONS).iter() {
+        if connection.target_addr.eq(&sockaddr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Init function: This is run before app starts
+#[no_mangle]
+#[link_section = ".init_array"]
+pub static LD_PRELOAD_INITIALISE_RUST: extern "C" fn() = self::init;
+extern "C" fn init() {
+    let singleton: HashMap<u32, Connection> = HashMap::new();
+    unsafe {
+        CONNECTIONS = transmute(Box::new(singleton));
+    }
+
+    let (listener_sender, listener_receiver) = channel::<Waker>();
+
+    std::thread::spawn(move || {
+        let mut runtime = Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let (connection_sender, connection_receiver) = channel::<(u32, SocketAddr)>();
+            unsafe {
+                CONNECTION_SENDER = transmute(Box::new(connection_sender));
+            }
+
+            // Create ConnectionListener
+            let mut listener = ConnectionListener::new(listener_sender, connection_receiver);
+
+            // Wait for incoming Connections
+            while let Some(connection) = listener.next().await {
+                let fd = connection.fd;
+                unsafe {
+                    (*CONNECTIONS).insert(fd, connection);
+                }
+                tokio::spawn(async move {
+                    let connection = unsafe { (*CONNECTIONS).get_mut(&fd) }.unwrap();
+                    let target = connection.target_addr.clone();
+                    let (connection_reader, connection_writer) = connection.split();
+                    println!("Hello new connection!");
+
+                    let stream = ProxyChains::connect(
+                        target,
+                        ProxyChainsConf {
+                            _mode: ProxyChainsMode::Dynamic,
+                        },
+                    )
+                    .await;
+
+                    if let Ok(mut stream) = stream {
+                        let (mut reader, mut writer) = stream.split();
+                        let _ = futures::try_join!(
+                            copy(connection_reader, &mut writer),
+                            copy(&mut reader, connection_writer)
+                        );
+                    } else {
+                        // LOG: failed to connect proxychains
+                    }
+                });
+                tokio::spawn(async move {}); // TODO: wtf ?!
+            }
+        });
+    });
+
+    unsafe {
+        CONNECTION_LISTENER_WAKER = transmute(Box::new(listener_receiver.recv().unwrap()));
+    }
+}
+
 // Hook connect function
 #[no_mangle]
 fn connect(socket: c_int, address: *const sockaddr, len: socklen_t) -> c_int {
@@ -47,7 +145,65 @@ fn connect(socket: c_int, address: *const sockaddr, len: socklen_t) -> c_int {
     let sa_data: [i8; 14] = unsafe { (*address).sa_data };
     let socket_addr = SocketAddr::new(ip(&sa_data[2..6]).into(), port(sa_data[0], sa_data[1]));
 
-    println!("Socket Address: {:?}", socket_addr);
+    unsafe {
+        if !exists(socket_addr) {
+            if let Ok(_) = (*CONNECTION_SENDER).send((socket as u32, socket_addr)) {
+                (*CONNECTION_LISTENER_WAKER).clone().wake();
+            } else {
+                // LOG: failed to send new connection info over the cahnnel
+            }
+        }
+    }
 
     c_connect(socket, address, len)
+}
+
+// Hook write function to get outgoing data
+#[no_mangle]
+fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
+    let c_write: fn(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t =
+        unsafe { transmute(fn_ptr("write")) };
+
+    // Check if write is called with a file descriptor that belongs to a socket connection
+    // Prevent the default behavior and redirect data to Connection instance
+    if let Some(connection) = unsafe { (*CONNECTIONS).get_mut(&(fd as u32)) } {
+        let content: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
+        let content: Vec<u8> = Vec::from(content);
+
+        // Redirect data to Connection instance
+        if let Some(waker) = connection.get_reader_waker().clone() {
+            if let Ok(_) = connection.get_reader_sender().send(content) {
+                waker.wake();
+            } else {
+                // LOG: failed to redirect data to Connection
+            }
+        }
+
+        count as isize
+    } else {
+        c_write(fd, buf, count)
+    }
+}
+
+// Hook read function to fill buffer with incoming data
+#[no_mangle]
+fn read(fd: c_int, buf: *mut c_void, count: size_t) -> ssize_t {
+    let c_read: fn(d: c_int, buf: *const c_void, count: size_t) -> ssize_t =
+        unsafe { transmute(fn_ptr("read")) };
+
+    // Check if reading from a socket
+    if let Some(connection) = unsafe { (*CONNECTIONS).get_mut(&(fd as u32)) } {
+        let buffer: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(buf as *mut u8, count as usize) };
+
+        let data = connection.get_writer_receiver().recv().unwrap();
+        data.iter().enumerate().for_each(|(i, c)| {
+            buffer[i] = *c;
+        });
+
+        data.len() as isize
+    } else {
+        c_read(fd, buf, count)
+    }
 }
