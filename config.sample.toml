@@ -1,0 +1,9 @@
+mode = "Strict"
+chain_len = 0
+
+[[proxies]]
+socket_addr = "127.0.0.1:1080"
+
+[[proxies]]
+socket_addr = "127.0.0.1:1081"
+auth = ["username", "password"]

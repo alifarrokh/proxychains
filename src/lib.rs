@@ -6,7 +6,7 @@ use connection::Connection;
 use connection_listener::ConnectionListener;
 use futures::{task::Waker, StreamExt};
 use libc::{c_int, c_void, size_t, sockaddr, socklen_t, ssize_t};
-use proxychains::{Proxy, ProxyChains, ProxyChainsConf, ProxyChainsMode};
+use proxychains::{Proxy, ProxyChains, ProxyChainsConf};
 use std::ffi::CString;
 use std::{
     collections::HashMap,
@@ -64,8 +64,8 @@ static mut CONNECTION_LISTENER_WAKER: *mut Waker = 0 as *mut _;
 // ConnectionListener
 static mut CONNECTION_SENDER: *mut Sender<(u32, SocketAddr)> = 0 as *mut _;
 
-// A vector containing the socket address of proxy servers
-static mut PROXIES: *mut Vec<Proxy> = 0 as *mut _;
+// Proxychanis Config
+static mut CONFIG: *mut ProxyChainsConf = 0 as *mut _;
 
 // Check if Connection to target address exists
 unsafe fn exists(sockaddr: SocketAddr) -> bool {
@@ -77,15 +77,23 @@ unsafe fn exists(sockaddr: SocketAddr) -> bool {
     return false;
 }
 
+// Get config
+fn config() -> &'static ProxyChainsConf {
+    unsafe { &(*CONFIG) }
+}
+
 // Get proxies
 fn proxies() -> &'static Vec<Proxy> {
-    unsafe { &(*PROXIES) }
+    unsafe { &(*CONFIG).proxies }
 }
 
 // Check if socket address is a proxy server
 // This is required to avoid recursion in connecting to servers
 fn is_proxy(addr: &SocketAddr) -> bool {
-    proxies().contains(&Proxy{socket_addr: *addr, auth: None})
+    proxies().contains(&Proxy {
+        socket_addr: *addr,
+        auth: None,
+    })
 }
 
 // Init function: This is run before app starts
@@ -93,24 +101,6 @@ fn is_proxy(addr: &SocketAddr) -> bool {
 #[link_section = ".init_array"]
 pub static LD_PRELOAD_INITIALISE_RUST: extern "C" fn() = self::init;
 extern "C" fn init() {
-    // Init proxies
-    // TODO: Use config file to load proxies
-    let proxy_list = vec![
-        Proxy {
-            socket_addr: "127.0.0.1:1080".parse().unwrap(),
-            auth: None,
-        },
-        Proxy {
-            socket_addr: "127.0.0.1:1081".parse().unwrap(),
-            auth: None,
-        },
-        Proxy {
-            socket_addr: "127.0.0.1:1082".parse().unwrap(),
-            auth: None,
-        },
-    ];
-    unsafe { PROXIES = transmute(Box::new(proxy_list)) }
-
     let singleton: HashMap<u32, Connection> = HashMap::new();
     unsafe {
         CONNECTIONS = transmute(Box::new(singleton));
@@ -119,6 +109,12 @@ extern "C" fn init() {
     let (listener_sender, listener_receiver) = channel::<Waker>();
 
     std::thread::spawn(move || {
+        // Initialize config
+        let conf = ProxyChainsConf::from_file("config.toml").expect("Failed to prase config file");
+        unsafe {
+            CONFIG = transmute(Box::new(conf));
+        }
+
         let mut runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
             let (connection_sender, connection_receiver) = channel::<(u32, SocketAddr)>();
@@ -140,15 +136,7 @@ extern "C" fn init() {
                     let target = connection.target_addr.clone();
                     let (connection_reader, connection_writer) = connection.split();
 
-                    let stream = ProxyChains::connect(
-                        target,
-                        ProxyChainsConf {
-                            mode: ProxyChainsMode::Strict,
-                            proxies: proxies(),
-                            chain_len: 0,
-                        },
-                    )
-                    .await;
+                    let stream = ProxyChains::connect(target, config()).await;
 
                     if let Ok(mut stream) = stream {
                         let (mut reader, mut writer) = stream.split();

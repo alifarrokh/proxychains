@@ -1,7 +1,9 @@
+use serde_derive::Deserialize;
 use socks5_async::connect_with_stream;
-use std::{error::Error, net::SocketAddr};
+use std::{error::Error, net::SocketAddr, fs::File, io::Read};
 use tokio::net::TcpStream;
 
+#[derive(Debug, Deserialize)]
 pub struct Proxy {
     pub socket_addr: SocketAddr,
     pub auth: Option<(String, String)>,
@@ -13,23 +15,34 @@ impl PartialEq for Proxy {
     }
 }
 
+#[derive(Debug, Deserialize)]
 pub enum ProxyChainsMode {
     Dynamic,
     Strict,
     Random,
 }
 
+#[derive(Debug, Deserialize)]
 pub struct ProxyChainsConf {
     pub mode: ProxyChainsMode,
-    pub proxies: &'static Vec<Proxy>,
+    pub proxies: Vec<Proxy>,
     pub chain_len: usize,
+}
+impl ProxyChainsConf {
+    pub fn from_file(path: &str) -> Result<Self, Box<dyn Error>> {
+        let mut file = File::open(path)?;
+        let mut content  = String::from("");
+        file.read_to_string(&mut content)?;
+        let conf: ProxyChainsConf = toml::from_str(&content).expect("Failed to parse");
+        Ok(conf)
+    }
 }
 
 pub struct ProxyChains {}
 impl ProxyChains {
     pub async fn connect(
         target_addr: SocketAddr,
-        conf: ProxyChainsConf,
+        conf: &ProxyChainsConf,
     ) -> Result<TcpStream, Box<dyn Error + Send + Sync>> {
         // validate the number of proxies
         if conf.proxies.len() < 1 {
