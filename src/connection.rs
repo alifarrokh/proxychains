@@ -79,7 +79,7 @@ impl AsyncRead for Reader {
     ) -> Poll<std::io::Result<usize>> {
         if let None = self.waker {
             self.waker = Some(cx.waker().clone());
-            return Poll::Pending;
+            return self.poll_read(cx, buf);
         }
         match self.receiver.try_recv() {
             Ok(data) => {

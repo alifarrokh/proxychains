@@ -6,7 +6,7 @@ use connection::Connection;
 use connection_listener::ConnectionListener;
 use futures::{task::Waker, StreamExt};
 use libc::{c_int, c_void, size_t, sockaddr, socklen_t, ssize_t};
-use proxychains::{ProxyChains, ProxyChainsConf, ProxyChainsMode};
+use proxychains::{Proxy, ProxyChains, ProxyChainsConf, ProxyChainsMode};
 use std::ffi::CString;
 use std::{
     collections::HashMap,
@@ -14,6 +14,8 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::mpsc::{channel, Sender},
 };
+#[allow(unused_imports)]
+use tokio::prelude::*;
 use tokio::{io::copy, runtime::Runtime};
 
 // Get function pointer
@@ -72,6 +74,16 @@ unsafe fn exists(sockaddr: SocketAddr) -> bool {
     return false;
 }
 
+// Check if socket address is a proxy server
+// This is required to avoid recursion in connecting to servers
+// TODO: make the function dynamic
+fn is_proxy(addr: &SocketAddr) -> bool {
+    let proxy1: SocketAddr = "127.0.0.1:1080".parse().unwrap();
+    let proxy2: SocketAddr = "127.0.0.1:1081".parse().unwrap();
+    let proxy3: SocketAddr = "127.0.0.1:1082".parse().unwrap();
+    *addr == proxy1 || *addr == proxy2 || *addr == proxy3
+}
+
 // Init function: This is run before app starts
 #[no_mangle]
 #[link_section = ".init_array"]
@@ -105,19 +117,35 @@ extern "C" fn init() {
                     let connection = unsafe { (*CONNECTIONS).get_mut(&fd) }.unwrap();
                     let target = connection.target_addr.clone();
                     let (connection_reader, connection_writer) = connection.split();
-                    println!("Hello new connection!");
+
+                    let proxies = vec![
+                        Proxy {
+                            socket_addr: "127.0.0.1:1080".parse().unwrap(),
+                            auth: None,
+                        },
+                        Proxy {
+                            socket_addr: "127.0.0.1:1081".parse().unwrap(),
+                            auth: None,
+                        },
+                        Proxy {
+                            socket_addr: "127.0.0.1:1082".parse().unwrap(),
+                            auth: None,
+                        },
+                    ];
 
                     let stream = ProxyChains::connect(
                         target,
                         ProxyChainsConf {
-                            _mode: ProxyChainsMode::Dynamic,
+                            mode: ProxyChainsMode::Strict,
+                            proxies,
+                            chain_len: 0,
                         },
                     )
                     .await;
 
                     if let Ok(mut stream) = stream {
                         let (mut reader, mut writer) = stream.split();
-                        let _ = futures::try_join!(
+                        let _ = futures::join!(
                             copy(connection_reader, &mut writer),
                             copy(&mut reader, connection_writer)
                         );
@@ -125,7 +153,6 @@ extern "C" fn init() {
                         // LOG: failed to connect proxychains
                     }
                 });
-                tokio::spawn(async move {}); // TODO: wtf ?!
             }
         });
     });
@@ -146,7 +173,7 @@ fn connect(socket: c_int, address: *const sockaddr, len: socklen_t) -> c_int {
     let socket_addr = SocketAddr::new(ip(&sa_data[2..6]).into(), port(sa_data[0], sa_data[1]));
 
     unsafe {
-        if !exists(socket_addr) {
+        if !exists(socket_addr) && !is_proxy(&socket_addr) {
             if let Ok(_) = (*CONNECTION_SENDER).send((socket as u32, socket_addr)) {
                 (*CONNECTION_LISTENER_WAKER).clone().wake();
             } else {
