@@ -7,6 +7,12 @@ pub struct Proxy {
     pub auth: Option<(String, String)>,
 }
 
+impl PartialEq for Proxy {
+    fn eq(&self, other: &Self) -> bool {
+        self.socket_addr == other.socket_addr
+    }
+}
+
 pub enum ProxyChainsMode {
     Dynamic,
     Strict,
@@ -15,7 +21,7 @@ pub enum ProxyChainsMode {
 
 pub struct ProxyChainsConf {
     pub mode: ProxyChainsMode,
-    pub proxies: Vec<Proxy>,
+    pub proxies: &'static Vec<Proxy>,
     pub chain_len: usize,
 }
 
