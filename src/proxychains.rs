@@ -112,6 +112,10 @@ async fn random(
     if conf.chain_len > conf.proxies.len() {
         Err("chain_len is greater than the number of proxies.")?;
     }
+    if conf.chain_len < 1 {
+        Err("chain_len is 0 !")?;
+    }
+
     let selection: Vec<_> = conf
         .proxies
         .choose_multiple(&mut rand::thread_rng(), conf.chain_len)
