@@ -1,9 +1,10 @@
+use rand::seq::SliceRandom;
 use serde_derive::Deserialize;
 use socks5_async::connect_with_stream;
-use std::{error::Error, net::SocketAddr, fs::File, io::Read};
+use std::{error::Error, fs::File, io::Read, net::SocketAddr};
 use tokio::net::TcpStream;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Proxy {
     pub socket_addr: SocketAddr,
     pub auth: Option<(String, String)>,
@@ -31,7 +32,7 @@ pub struct ProxyChainsConf {
 impl ProxyChainsConf {
     pub fn from_file(path: &str) -> Result<Self, Box<dyn Error>> {
         let mut file = File::open(path)?;
-        let mut content  = String::from("");
+        let mut content = String::from("");
         file.read_to_string(&mut content)?;
         let conf: ProxyChainsConf = toml::from_str(&content).expect("Failed to parse");
         Ok(conf)
@@ -51,9 +52,10 @@ impl ProxyChains {
 
         let stream = match conf.mode {
             ProxyChainsMode::Strict => strict(target_addr, &conf).await.fix_box()?,
+            ProxyChainsMode::Random => random(target_addr, &conf).await.fix_box()?,
 
-            // TODO: implement other modes
-            _ => TcpStream::connect(target_addr).await?,
+            // TODO: implement this method
+            ProxyChainsMode::Dynamic => TcpStream::connect(target_addr).await?,
         };
 
         Ok(stream)
@@ -100,6 +102,29 @@ fn strict_next_addr<'a>(
     } else {
         target_addr
     }
+}
+
+// Random proxychains stream generator
+async fn random(
+    target_addr: SocketAddr,
+    conf: &ProxyChainsConf,
+) -> Result<TcpStream, Box<dyn Error>> {
+    if conf.chain_len > conf.proxies.len() {
+        Err("chain_len is greater than the number of proxies.")?;
+    }
+    let selection: Vec<_> = conf
+        .proxies
+        .choose_multiple(&mut rand::thread_rng(), conf.chain_len)
+        .map(|x| x.clone())
+        .collect();
+
+    let new_config = ProxyChainsConf {
+        chain_len: conf.chain_len,
+        proxies: selection,
+        mode: ProxyChainsMode::Strict,
+    };
+
+    strict(target_addr, &new_config).await
 }
 
 // We are currently unable to convert a Box<dyn Error>
