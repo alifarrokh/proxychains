@@ -12,11 +12,20 @@ use std::{
     collections::HashMap,
     mem::transmute,
     net::{Ipv4Addr, SocketAddr},
+    path::PathBuf,
     sync::mpsc::{channel, Sender},
 };
+use structopt::StructOpt;
 #[allow(unused_imports)]
 use tokio::prelude::*;
 use tokio::{io::copy, runtime::Runtime};
+
+// Args
+#[derive(Debug, StructOpt)]
+struct Args {
+    #[structopt(parse(from_os_str), short, long, default_value = "config.toml")]
+    config: PathBuf,
+}
 
 // Get function pointer
 pub unsafe fn fn_ptr(name: &str) -> *mut core::ffi::c_void {
@@ -97,6 +106,9 @@ fn is_proxy(addr: &SocketAddr) -> bool {
 }
 
 // Init function: This is run before app starts
+// NOTICE: print!(), println!() and ... are not available in this function
+// You can only use init function for initialization
+// Other codes must be written inside the spawned thread
 #[no_mangle]
 #[link_section = ".init_array"]
 pub static LD_PRELOAD_INITIALISE_RUST: extern "C" fn() = self::init;
@@ -109,8 +121,12 @@ extern "C" fn init() {
     let (listener_sender, listener_receiver) = channel::<Waker>();
 
     std::thread::spawn(move || {
+        // Parse args
+        let args: Args = Args::from_args();
+
         // Initialize config
-        let conf = ProxyChainsConf::from_file("config.toml").expect("Failed to prase config file");
+        let conf = ProxyChainsConf::from_file(args.config.to_str().unwrap())
+            .expect("Failed to prase config file");
         unsafe {
             CONFIG = transmute(Box::new(conf));
         }
