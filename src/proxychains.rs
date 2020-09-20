@@ -1,6 +1,6 @@
 use rand::seq::SliceRandom;
 use serde_derive::Deserialize;
-use socks5_async::connect_with_stream;
+use socks5_async::{cmd_connect, connect_with_stream, socks_handshake};
 use std::{error::Error, fs::File, io::Read, net::SocketAddr};
 use tokio::net::TcpStream;
 
@@ -53,9 +53,7 @@ impl ProxyChains {
         let stream = match conf.mode {
             ProxyChainsMode::Strict => strict(target_addr, &conf).await.fix_box()?,
             ProxyChainsMode::Random => random(target_addr, &conf).await.fix_box()?,
-
-            // TODO: implement this method
-            ProxyChainsMode::Dynamic => TcpStream::connect(target_addr).await?,
+            ProxyChainsMode::Dynamic => dynamic(target_addr, &conf).await.fix_box()?,
         };
 
         Ok(stream)
@@ -129,6 +127,38 @@ async fn random(
     };
 
     strict(target_addr, &new_config).await
+}
+
+// Dynamic proxychains stream generator
+async fn dynamic(
+    target_addr: SocketAddr,
+    conf: &ProxyChainsConf,
+) -> Result<TcpStream, Box<dyn Error>> {
+    // Filter alive proxy servers
+    let mut filtered_proxies = vec![];
+    for proxy in conf.proxies.iter() {
+        if let Ok(mut stream) = TcpStream::connect(proxy.socket_addr).await {
+            // TODO: fix this!
+            let mut ok = false;
+            {
+                if let Ok(_) = socks_handshake(&mut stream, proxy.auth.clone()).await {
+                    ok = true;
+                }
+            }
+            if ok {
+                let _ = cmd_connect(&mut stream, target_addr.clone()).await;
+                filtered_proxies.push(proxy.clone());
+            }
+        }
+    }
+
+    let new_conf = ProxyChainsConf {
+        chain_len: 0,
+        mode: ProxyChainsMode::Strict,
+        proxies: filtered_proxies,
+    };
+
+    strict(target_addr, &new_conf).await
 }
 
 // We are currently unable to convert a Box<dyn Error>
