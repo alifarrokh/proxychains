@@ -153,15 +153,15 @@ extern "C" fn init() {
                     let (connection_reader, connection_writer) = connection.split();
 
                     let stream = ProxyChains::connect(target, config()).await;
-
-                    if let Ok(mut stream) = stream {
-                        let (mut reader, mut writer) = stream.split();
+                    match stream {
+                        Ok(mut stream) => {
+                            let (mut reader, mut writer) = stream.split();
                         let _ = futures::join!(
                             copy(connection_reader, &mut writer),
                             copy(&mut reader, connection_writer)
                         );
-                    } else {
-                        // LOG: failed to connect proxychains
+                        },
+                        Err(e) => eprintln!("Failed to create proxychains. {}", e.to_string()),
                     }
                 });
             }
@@ -188,7 +188,7 @@ fn connect(socket: c_int, address: *const sockaddr, len: socklen_t) -> c_int {
             if let Ok(_) = (*CONNECTION_SENDER).send((socket as u32, socket_addr)) {
                 (*CONNECTION_LISTENER_WAKER).clone().wake();
             } else {
-                // LOG: failed to send new connection info over the cahnnel
+                eprintln!("Failed to send new connection info over the cahnnel.");
             }
         }
     }
@@ -214,7 +214,7 @@ fn write(fd: c_int, buf: *const c_void, count: size_t) -> ssize_t {
             if let Ok(_) = connection.get_reader_sender().send(content) {
                 waker.wake();
             } else {
-                // LOG: failed to redirect data to Connection
+                eprintln!("Failed to get reader waker.");
             }
         }
 
